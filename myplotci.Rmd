@@ -1,0 +1,186 @@
+An old hack for working around the (formerly) missing plot.ci()
+===============================================================
+
+Introduction
+------------
+
+The [Zelig](http://gking.harvard.edu/zelig) package has a `plot.ci()` function that in its original form allowed you to plot the uncertainty around your estimated relationship in the form of a series of vertical bars whose height covers the 95% confidence interval around your estimated response for a set of simulated values of the covariate of interest. 
+
+These bars follow the curve that you would normally plot to describe the relationship, and they do the job of the CI shadow in Stata's fit class of graphical commands, such as [`lfitci`](http://data.princeton.edu/stata/graphics.html) or in ggplot2's [`geom_ribbon`](http://www.ats.ucla.edu/stat/r/dae/logit.htm) option. 
+
+The [canonical example](http://rss.acs.unt.edu/Rdoc/library/Zelig/html/plot.ci.html)  of `plot.ci()` promises to produce a picture that illustrates this capability very nicely in a logit model of voting as a function of age, age squared and education, first introduced [here](http://gking.harvard.edu/files/making.pdf) (p. 355).
+
+That example did not work for me. I reported it on the Zelig mailing list but I never received an answer. So, at the time, I had to find a workaround. I made use of [ggplot2](http://ggplot2.org/). The goal was to replicate as best I could the picture on slide 23 of [this deck](http://imai.princeton.edu/talk/files/kansas10.pdf).
+
+The hack
+--------
+
+I started here:
+
+```{r setUp, eval=TRUE, warning=FALSE, message=FALSE, cache=TRUE, results='hide'}
+library(Zelig)
+rm(list=ls(all=TRUE))
+data(turnout)
+z.out <- zelig(vote ~ race + educate
+               + age + I(age^2) + income, model = "logit", data = turnout)
+age.range <- 18:95
+x.low <- setx(z.out, educate = 12, age = age.range)
+x.high <- setx(z.out, educate = 16, age = age.range)
+s.out <- sim(z.out, x = x.low, x1 = x.high)
+# The part that doesn't work:
+# plot.ci(s.out, xlab = xl, ylab = yl, main = ma
+# legend(45, 0.52, legend = c("College Education (16 years)", "High School Education (12 years)"), col = c("blue","red"), lty = c("solid"))
+# For an idea of what may be inside s.out, do:
+summary(s.out)
+```
+
+Here's what the Zelig CI curve looks like today:
+
+```{r showZeligPlot, echo=FALSE, eval=TRUE, warning=FALSE, message=FALSE, cache=TRUE, fig.width=7, fig.height=6}
+plot.ci(s.out)
+```
+
+And here's what I did when the old `plot.ci()` went missing:
+
+```{r theHack, eval=TRUE, warning=FALSE, message=FALSE, cache=TRUE, results='hide'}
+# Will you need predicted or expected values? Just get both.  Also, ggplot
+# will need a data frame, so you might as well package them now.
+require(ggplot2)
+                  
+# 1. Get data frame of results ready for ggplot2
+getLongDf <- function(sims, xvar, zvar) {
+  # First, collect simulation results:
+  collectSim <- function(simstats) {
+    # define function that works on one element of the
+    # summary(s.out)[['stats']] list, then sapply it.
+    collectSimValues <- function(srow) {
+      # expected values
+      x.lo <- srow[[1]] # mean, sd 95% CI bounds for x 
+      x.hi <- srow[[2]] # mean, sd 95% CI bounds for x1
+      # predicted values:
+      p.lo <- srow[[3]] # P(y=0), P(y=1) conditioned on x 
+      p.hi <- srow[[4]] # P(y=0), P(y=1) conditioned on x1
+      # rename things
+      colnames(x.lo) <- paste(colnames(x.lo),sep='.','lo')
+      colnames(x.hi) <- paste(colnames(x.hi),sep='.','hi')
+      colnames(p.lo) <- paste('p',colnames(p.lo),'lo',sep='.')
+      colnames(p.hi) <- paste('p',colnames(p.hi),'hi',sep='.')
+      lo <- cbind(x.lo,p.lo)
+      hi <- cbind(x.hi,p.hi)
+      x <- as.vector(cbind(lo,hi))
+      names(x) <- c(colnames(x.lo),colnames(p.lo),colnames(x.hi),colnames(p.hi))
+      return(x)
+    }
+    # Get values out of row names of simValues data frame
+    fixIt <- function(dfrowname) {
+      kvpairs <- sapply(strsplit(dfrowname,',')[[1]],strsplit,"=")
+      names   <- sapply(names(kvpairs),function(x){return(strsplit(x[1],"=")[[1]][1])})
+      values  <- sapply(names(kvpairs),function(x){return(strsplit(x[1],"=")[[1]][2])})
+      names(names) <- NULL
+      names(values) <- sub("^ ","",names)
+      return(values)
+    }
+    simValues   <- as.data.frame(t(sapply(simstats,collectSimValues)))
+    covarset    <- as.data.frame(t(sapply(rownames(simValues),fixIt)))
+    covarset$m  <- rownames(covarset)
+    simValues$m <- rownames(simValues)
+    keepit <- subset(merge(covarset,simValues,by='m'),select=-m)
+    return(keepit)
+  } 
+  df <- collectSim(summary(sims)[['stats']])  
+  df <- subset(df,select=-get(xvar))
+  df <- df[order(df[[zvar]]),]
+  
+  names.lo     <- names(df)[grep("lo$",names(df))]
+  names.hi     <- names(df)[grep("hi$",names(df))]
+  names.covars <- names(df)[!(names(df) %in% c(names.lo,names.hi))]
+  
+  df.lo <- df[,c(names.covars,names.lo)]
+  names(df.lo)[names(df.lo) %in% names.lo] <- sub(".lo","",names.lo)
+  df.lo[[xvar]]=12
+  df.hi <- df[,c(names.covars,names.hi)]
+  names(df.hi)[names(df.hi) %in% names.hi] <- sub(".hi","",names.hi)
+  df.hi[[xvar]]=16
+  df.long <- rbind(df.lo,df.hi)
+  return(df.long)
+}
+
+# 2. Draw the estimated curve graph -- predicted or expected
+# probability of outcome of interest
+# (predicted: p.1, expected: mean).  
+drawPPic <- function(df,xvar,zvar,pvar,ma,xl,yl) {
+  mydf <- df[,c(xvar, zvar, pvar)]
+  mydf[[xvar]] <- factor(mydf[[xvar]],levels=c(12,16),
+                     labels=c("High School (12 years)", "College (16 years)"))  
+  pic <- ggplot(data = mydf, aes_string(x = zvar, y = pvar, group = xvar, color = xvar)) + 
+    geom_line() + xlab(xl) + ylab(yl) + ggtitle(ma)
+  pic <- pic + scale_color_manual(name="Education", values = c("red", "blue"))
+  pic <- pic + theme(legend.position = c(0.75, 0.25))
+  return(pic)
+}
+
+# 3. Draw CI plots.
+getCIplot <- function(df,xvar,zvar,ma,xl,yl) {
+  # First, get the 95CI for p.2d7, by xvar, 
+  # and make it long for ggplot to use (in
+  # Wickham-speak: make it tidy)
+  getCIData <- function(df,xvar,zvar) {
+    p <- df[, c("2.5%", "97.5%", xvar, zvar)]
+    names(p)[1:2] <- c("lower", "upper")
+    p.long <- reshape(p, direction = "long", varying = c("lower", "upper"), 
+                      v.names = "value", idvar = c(xvar, zvar), timevar = "ci", 
+                      times = c("lower", "upper"))
+    p.long.sorted <- p.long[order(p.long[[xvar]], p.long[[zvar]], p.long$ci), ]
+    return(p.long.sorted)
+  }
+  foo <- getCIData(df,xvar,zvar)
+  foo[[xvar]] <- factor(foo[[xvar]],levels=c(12,16),
+                     labels=c("High School (12 years)", "College (16 years)"))
+  foo$grouping <- foo[[zvar]] + as.numeric(foo[[xvar]])/10
+  p <- ggplot(data = foo, aes_string(x = zvar, y = 'value', group = zvar, colour = xvar)) + 
+    geom_line(aes(group = grouping)) + geom_point() + xlab(xl) + ylab(yl) + 
+    ggtitle(ma)
+  # Set the colors by hand, change the legend
+  p <- p + scale_color_manual(name = "Education", values = c("red", "blue"))
+  # Position legend inside the graph
+  p <- p + theme(legend.position = c(0.75, 0.25))
+  return(p)
+}
+
+# set up data frame for pictures
+df.long <- getLongDf(s.out,'educate','age')
+df.long$race <- as.character(df.long$race)
+df.long$income <- as.numeric(as.character(df.long$income))
+df.long$age <- as.numeric(as.character(df.long$age))
+
+# pictures:
+xl <- "Age in Years"
+yl <- "Expected Probability of Voting"
+ma <- "Effect of Education and Age on Voting Behavior"
+ppic <- drawPPic(df.long,'educate','age','mean',ma,xl,yl) # expected P(1)
+plot.ci <-  getCIplot(df.long,'educate','age',ma,xl,yl)
+```
+
+So, here's the `ppic` relationship I want to plot:
+
+```{r showEPic, echo=FALSE, eval=TRUE, warning=FALSE, message=FALSE, cache=TRUE, fig.width=7, fig.height=6}
+ppic
+```
+
+And here's the `plot.ci` uncertainty picture with vertical CI bars:
+
+```{r showPlotCI, echo=FALSE, eval=TRUE, warning=FALSE, message=FALSE, cache=TRUE, fig.width=7, fig.height=6}
+plot.ci
+```
+
+Why is this representation of uncertainty more useful than some kind of variation on the shaded areas that you get from Stata's `*fitci` commands and from Zelig's own new `plot.ci()` picture? One example is at the bottom of [this post](http://rpubs.com/ghuiber/moneytalks).
+
+Notes
+-----
+
+The little knobs at the ends of the bars help you see where the bars overlap. You can turn them off by deleting `+ geom_point()` in the expression for `p` in the body of `getCIPlot()`, but I don't recommend it.
+
+Thanks
+------
+
+[Bryan Shepherd](https://twitter.com/bryancshepherd) gave me the idea of putting some kind of markers at the ends of these vertical bars; the knobs were just an easy choice. Everything I know about ggplot2 I learned from the website of [Winston Chang](http://www.cookbook-r.com/). Buy his [book](http://shop.oreilly.com/product/0636920023135.do). Take [Gary King's methods class](http:j.mp/G2001) for a proper introduction to Zelig. I'm glad I did.
